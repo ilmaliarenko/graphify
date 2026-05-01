@@ -1,0 +1,30 @@
+version: 2
+
+models:
+  - name: daily_book_sales
+    description: "Aggregated daily revenue by ISBN."
+    columns:
+      - name: book_isbn
+        tests: [not_null, unique]
+      - name: revenue
+        tests:
+          - not_null
+
+  - name: monthly_top_authors
+    description: "Top 10 authors per calendar month by gross revenue."
+    columns:
+      - name: author
+      - name: rank
+
+sources:
+  - name: warehouse
+    schema: bookstore_raw
+    tables:
+      - name: book_catalog
+        description: "Master catalog of titles in inventory."
+      - name: orders_log
+        description: "Append-only log of paid orders."
+
+seeds:
+  - name: ref_genres
+    description: "Static genre code → label mapping."

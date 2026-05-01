@@ -1843,6 +1843,129 @@ def extract_dbt_sql(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
+_DBT_YAML_TOP_SECTIONS = {"models", "sources", "seeds", "snapshots", "exposures",
+                          "metrics", "semantic_models", "analyses"}
+# Keys whose values describe per-entity structure (column lists, tests, …) —
+# we skip recursing into them so individual column "name:" pairs don't get
+# misread as model definitions.
+_DBT_YAML_LEAF_KEYS = {"columns", "tests", "data_tests", "config", "meta",
+                       "constraints", "freshness", "loaded_at_field",
+                       "description", "external", "quoting",
+                       "loaded_at_query", "tags", "identifier",
+                       "database", "schema"}
+
+
+def extract_dbt_yaml(path: Path) -> dict:
+    """Extract dbt schema-style YAML structure (`models:`, `sources:`, `seeds:`,
+    `snapshots:`, `exposures:`, `metrics:`) into nodes/edges.
+
+    Each entity becomes a node whose ID matches what `extract_dbt_sql` would
+    produce for the corresponding `.sql` file (e.g. a `name: silver_x` under
+    `models:` produces id `silver_x`, the same id as the `silver_x.sql` file
+    node). So loading both extractions into the same graph naturally merges
+    documentation onto the model node.
+
+    Designed to be **opt-in**: `.yml` / `.yaml` files are NOT auto-classified
+    as code by `detect.py` (they remain in `DOC_EXTENSIONS` so non-dbt YAML
+    corpora — Kubernetes, Kustomize, Helm — keep going through the semantic
+    pipeline). Callers that want dbt YAML structurally extracted invoke this
+    function explicitly (e.g. `graphify ast-only` does so for dbt projects).
+    """
+    try:
+        import tree_sitter_yaml as tsy
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return {"nodes": [], "edges": [], "error": "tree_sitter_yaml not installed. Run: pip install tree-sitter-yaml"}
+
+    try:
+        language = Language(tsy.language())
+        parser = Parser(language)
+        source = path.read_bytes()
+        tree = parser.parse(source)
+        root = tree.root_node
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    str_path = str(path)
+    file_nid = _make_id("yaml", path.stem)
+    nodes: list[dict] = [{"id": file_nid, "label": path.name, "file_type": "code",
+                          "source_file": str_path, "source_location": "L1"}]
+    edges: list[dict] = []
+    seen_ids: set[str] = {file_nid}
+
+    def _read(n) -> str:
+        return source[n.start_byte:n.end_byte].decode("utf-8", errors="replace")
+
+    def _ensure_node(nid: str, label: str, line: int) -> None:
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({"id": nid, "label": label, "file_type": "code",
+                          "source_file": str_path, "source_location": f"L{line}"})
+
+    def _add_named_node(section: str, name_val: str, line: int) -> None:
+        if section == "sources":
+            nid = _make_id("source", name_val)
+            label, rel = f"source.{name_val}", "defines_source"
+        elif section == "seeds":
+            nid = _make_id("seed", name_val)
+            label, rel = f"seed.{name_val}", "defines_seed"
+        elif section == "snapshots":
+            nid = _make_id("snapshot", name_val)
+            label, rel = name_val, "documents_snapshot"
+        elif section == "models":
+            # Same id `extract_dbt_sql` produces for the corresponding .sql
+            nid = _make_id(name_val)
+            label, rel = name_val, "documents"
+        else:
+            nid = _make_id(section, name_val)
+            label, rel = f"{section}.{name_val}", f"defines_{section}"
+        _ensure_node(nid, label, line)
+        edges.append({"source": file_nid, "target": nid, "relation": rel,
+                      "confidence": "EXTRACTED", "source_file": str_path,
+                      "source_location": f"L{line}", "weight": 1.0})
+
+    def walk_pairs(node, current_section: str | None = None) -> None:
+        for child in node.children:
+            if child.type in ("block_mapping_pair", "flow_pair"):
+                key_node = child.child_by_field_name("key")
+                value_node = child.child_by_field_name("value")
+                if key_node is None or value_node is None:
+                    nk = [c for c in child.children if c.is_named]
+                    if len(nk) >= 2:
+                        key_node, value_node = nk[0], nk[1]
+                if key_node is None:
+                    continue
+                key_text = _read(key_node).strip()
+                line = child.start_point[0] + 1
+
+                # Top-level section — descend with section context
+                if current_section is None and key_text in _DBT_YAML_TOP_SECTIONS:
+                    if value_node:
+                        walk_pairs(value_node, current_section=key_text)
+                    continue
+                # Inside a section, "name: foo" defines an entity
+                if current_section and key_text == "name" and value_node:
+                    name_val = _read(value_node).strip().strip("'\"")
+                    if name_val and "{{" not in name_val:
+                        _add_named_node(current_section, name_val, line)
+                    continue
+                # Skip per-entity sub-sections (columns/tests/etc.)
+                if current_section and key_text in _DBT_YAML_LEAF_KEYS:
+                    continue
+                # `tables:` inside sources keeps section=sources
+                if current_section == "sources" and key_text == "tables" and value_node:
+                    walk_pairs(value_node, current_section="sources")
+                    continue
+                # Recurse with same section
+                if value_node:
+                    walk_pairs(value_node, current_section=current_section)
+            else:
+                walk_pairs(child, current_section=current_section)
+
+    walk_pairs(root)
+    return {"nodes": nodes, "edges": edges}
+
+
 def extract_sql(path: Path) -> dict:
     """Extract tables, views, functions, and relationships from .sql files via tree-sitter.
 
@@ -3784,13 +3907,23 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
         ".sql": extract_sql,
         ".tf": extract_terraform,
         ".hcl": extract_terraform,
+        # .yml / .yaml are NOT auto-classified as code (still in DOC_EXTENSIONS
+        # so non-dbt YAML stays in the semantic pipeline), but if a caller
+        # explicitly hands us one — e.g. `graphify ast-only` discovering schema
+        # YAML in a dbt project — route through the dbt YAML extractor.
+        # In a non-dbt context, extract_dbt_yaml emits an empty/single-node
+        # result, which is the right no-op behaviour (no false structural edges).
+        ".yml": extract_dbt_yaml,
+        ".yaml": extract_dbt_yaml,
     }
 
     total = len(paths)
     _PROGRESS_INTERVAL = 100
     for i, path in enumerate(paths):
         if total >= _PROGRESS_INTERVAL and i % _PROGRESS_INTERVAL == 0 and i > 0:
-            print(f"  AST extraction: {i}/{total} files ({i * 100 // total}%)", flush=True)
+            # Progress goes to stderr so machine-readable consumers
+            # (graphify ast-only, query, etc.) get clean stdout.
+            print(f"  AST extraction: {i}/{total} files ({i * 100 // total}%)", flush=True, file=sys.stderr)
         # .blade.php must be checked before suffix lookup since Path.suffix returns .php
         if path.name.endswith(".blade.php"):
             extractor = extract_blade
@@ -3807,7 +3940,7 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
             save_cached(path, result, cache_root or root)
         per_file.append(result)
     if total >= _PROGRESS_INTERVAL:
-        print(f"  AST extraction: {total}/{total} files (100%)", flush=True)
+        print(f"  AST extraction: {total}/{total} files (100%)", flush=True, file=sys.stderr)
 
     all_nodes: list[dict] = []
     all_edges: list[dict] = []
