@@ -57,14 +57,11 @@ def test_extract_merges_multiple_files():
 
 
 def test_collect_files_from_dir():
+    from graphify.detect import CODE_EXTENSIONS
     files = collect_files(FIXTURES)
-    supported = {".py", ".js", ".ts", ".tsx", ".go", ".rs",
-                 ".java", ".c", ".cpp", ".cc", ".cxx", ".rb",
-                 ".cs", ".kt", ".kts", ".scala", ".php", ".h", ".hpp",
-                 ".swift", ".lua", ".toc", ".zig", ".ps1", ".ex", ".exs",
-                 ".m", ".mm",
-                 ".sql", ".tf", ".hcl"}
-    assert all(f.suffix in supported for f in files)
+    # collect_files derives its supported set from detect.CODE_EXTENSIONS,
+    # so this assertion stays correct as new languages are added.
+    assert all(f.suffix in CODE_EXTENSIONS for f in files)
     assert len(files) > 0
 
 
