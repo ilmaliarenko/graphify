@@ -22,7 +22,12 @@ def _check_skill_version(skill_dst: Path) -> None:
         return
     installed = version_file.read_text(encoding="utf-8").strip()
     if installed != __version__:
-        print(f"  warning: skill is from graphify {installed}, package is {__version__}. Run 'graphify install' to update.")
+        # Warnings go to stderr so they don't pollute machine-readable
+        # stdout (e.g. `graphify ast-only` JSON, `graphify query` output).
+        print(
+            f"  warning: skill is from graphify {installed}, package is {__version__}. Run 'graphify install' to update.",
+            file=sys.stderr,
+        )
 
 
 def _refresh_all_version_stamps() -> None:
@@ -65,6 +70,12 @@ _SKILL_REGISTRATION = (
     "- any input to knowledge graph. Trigger: `/graphify`\n"
     "When the user types `/graphify`, invoke the Skill tool "
     "with `skill: \"graphify\"` before doing anything else.\n"
+    "\n"
+    "## Plan mode\n"
+    "When operating in plan mode (read-only, no writes) and `graphify-out/graph.json` exists:\n"
+    "- READ `graphify-out/GRAPH_REPORT.md` (god nodes, communities, surprising connections) and `graph.json` directly — they are static artefacts, safe to read in plan mode.\n"
+    "- For impact-analysis questions (\"what depends on X\", \"what does X import\", \"how is Y connected to Z\"), prefer querying the graph over `grep`/`find`/`rg` through the source tree.\n"
+    "- For a fresh AST snapshot of a file or directory **without writing to `graphify-out/`**, run `graphify ast-only <path>` — it uses a temp cache root, prints JSON to stdout, never calls an LLM. Plan-mode-safe.\n"
 )
 
 
@@ -212,6 +223,13 @@ Rules:
 - If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
 - For cross-module "how does X relate to Y" questions, prefer `graphify query "<question>"`, `graphify path "<A>" "<B>"`, or `graphify explain "<concept>"` over grep — these traverse the graph's EXTRACTED + INFERRED edges instead of scanning files
 - After modifying code files in this session, run `graphify update .` to keep the graph current (AST-only, no API cost)
+
+### In plan mode
+
+When operating in plan mode (read-only — no edits, no writes outside the plan file):
+- READ `graphify-out/GRAPH_REPORT.md` and `graph.json` directly. They are static artefacts, fully safe to read in plan mode.
+- For impact-analysis questions ("what depends on X", "how does Y reach Z"), prefer querying the graph over `grep`/`find`/`rg` — `graphify query`/`path`/`explain` only read graph.json and never write.
+- For a fresh AST snapshot of a file or directory **without writing to graphify-out/**, run `graphify ast-only <path>` — it uses a temp cache root, prints JSON to stdout, never calls an LLM. Plan-mode-safe.
 """
 
 _CLAUDE_MD_MARKER = "## graphify"
@@ -1016,9 +1034,12 @@ def _clone_repo(url: str, branch: str | None = None, out_dir: Path | None = None
 
 def main() -> None:
     # Check all known skill install locations for a stale version stamp.
-    # Skip during install/uninstall (hook writes trigger a fresh check anyway).
+    # Skip during install/uninstall (hook writes trigger a fresh check anyway)
+    # and during silent commands like `hook-check` that must produce zero output
+    # to keep PreToolUse hooks safe on all platforms.
     # Deduplicate paths so platforms sharing the same install dir don't warn twice.
-    if not any(arg in ("install", "uninstall") for arg in sys.argv):
+    _SILENT_COMMANDS = ("install", "uninstall", "hook-check")
+    if not any(arg in _SILENT_COMMANDS for arg in sys.argv):
         for skill_dst in {Path.home() / cfg["skill_dst"] for cfg in _PLATFORM_CONFIG.values()}:
             _check_skill_version(skill_dst)
 
@@ -1066,6 +1087,9 @@ def main() -> None:
         print("    --top-k-edges N         per-symbol outbound edges in inspector (default 12)")
         print("    --label NAME            project label in header")
         print("  benchmark [graph.json]  measure token reduction vs naive full-corpus approach")
+        print("  ast-only <path>         AST-only extraction to stdout (no cache writes, no LLM) — plan-mode-safe")
+        print("    --cache-root DIR        cache dir (default: /tmp/graphify-ast)")
+        print("    --no-cache              force fresh extraction (ignore cache)")
         print("  hook install            install post-commit/post-checkout git hooks (all platforms)")
         print("  hook uninstall          remove git hooks")
         print("  hook status             check if git hooks are installed")
@@ -1686,6 +1710,61 @@ def main() -> None:
                 pass
         result = run_benchmark(graph_path, corpus_words=corpus_words)
         print_benchmark(result)
+
+    elif cmd == "ast-only":
+        # Plan-mode-safe AST extraction: writes nothing under the user's project
+        # (uses a temp cache root), never calls an LLM. Outputs the merged
+        # extraction dict as JSON to stdout. Useful for an agent in plan mode
+        # that needs a fresh structural view of a file or directory without
+        # disturbing graphify-out/.
+        if len(sys.argv) < 3 or sys.argv[2] in ("-h", "--help"):
+            print("Usage: graphify ast-only <path> [--cache-root DIR] [--no-cache]", file=sys.stderr)
+            print("  --cache-root DIR  cache directory (default: /tmp/graphify-ast)", file=sys.stderr)
+            print("  --no-cache        force a fresh extraction even if cached results exist", file=sys.stderr)
+            sys.exit(2)
+
+        target = Path(sys.argv[2]).expanduser().resolve()
+        if not target.exists():
+            print(f"error: path not found: {target}", file=sys.stderr)
+            sys.exit(1)
+
+        cache_root = Path("/tmp/graphify-ast")
+        no_cache = False
+        args = sys.argv[3:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--cache-root" and i + 1 < len(args):
+                cache_root = Path(args[i + 1]).expanduser().resolve()
+                i += 2
+            elif args[i] == "--no-cache":
+                no_cache = True
+                i += 1
+            else:
+                i += 1
+
+        from graphify.extract import collect_files, extract
+
+        if target.is_file():
+            files = [target]
+        else:
+            files = collect_files(target)
+
+        if not files:
+            print(json.dumps({"nodes": [], "edges": [], "warning": "no code files found",
+                              "scanned": str(target)}, indent=2), flush=True)
+            return
+
+        if no_cache:
+            # Use a unique scratch dir so cache lookups always miss
+            import tempfile, uuid
+            cache_root = Path(tempfile.gettempdir()) / f"graphify-ast-nocache-{uuid.uuid4().hex[:8]}"
+        cache_root.mkdir(parents=True, exist_ok=True)
+
+        result = extract(files, cache_root=cache_root)
+        result["scanned"] = str(target)
+        result["files_extracted"] = len(files)
+        print(json.dumps(result, indent=2), flush=True)
+
     else:
         print(f"error: unknown command '{cmd}'", file=sys.stderr)
         print("Run 'graphify --help' for usage.", file=sys.stderr)

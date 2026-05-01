@@ -365,6 +365,21 @@ Works with any mix of file types:
 | Video / Audio | `.mp4 .mov .mkv .webm .avi .m4v .mp3 .wav .m4a .ogg` | Transcribed locally with faster-whisper, transcript fed into Claude extraction (requires `pip install graphifyy[video]`) |
 | YouTube / URLs | any video URL | Audio downloaded via yt-dlp, then same Whisper pipeline (requires `pip install graphifyy[video]`) |
 
+## Plan mode
+
+If your AI coding assistant has a plan mode (read-only — no edits, no file writes outside a plan file), graphify is fully usable from inside it:
+
+- The graph artefacts (`graphify-out/graph.json`, `GRAPH_REPORT.md`) are static files — safe to read in plan mode.
+- `graphify query`, `graphify path`, `graphify explain` only read `graph.json` — safe to run in plan mode.
+- For a fresh AST snapshot of a file or directory **without writing to `graphify-out/`**:
+  ```bash
+  graphify ast-only <path>            # JSON to stdout, cache in /tmp/graphify-ast
+  graphify ast-only <path> --no-cache # force fresh extraction, fresh tempdir
+  ```
+  No LLM, no `graphify-out/` writes — purely structural extraction. Useful when you want to orient yourself in code that hasn't been graphed yet.
+
+The `graphify install` text now includes plan-mode rules so any agent running on a project gets these instructions automatically.
+
 ## Video and audio corpus
 
 Drop video or audio files into your corpus folder alongside your code and docs — graphify picks them up automatically:

@@ -17,12 +17,21 @@ def test_install_creates_claude_md(tmp_path):
 
 
 def test_install_contains_expected_rules(tmp_path):
-    """Written section includes the three rules."""
+    """Written section includes the core rules."""
     claude_install(tmp_path)
     content = (tmp_path / "CLAUDE.md").read_text()
     assert "GRAPH_REPORT.md" in content
     assert "wiki/index.md" in content
     assert "graphify update" in content
+
+
+def test_install_contains_plan_mode_block(tmp_path):
+    """Written section includes plan-mode guidance + ast-only command."""
+    claude_install(tmp_path)
+    content = (tmp_path / "CLAUDE.md").read_text()
+    assert "plan mode" in content.lower()
+    assert "ast-only" in content
+    assert "graph.json" in content
 
 
 def test_install_appends_to_existing_claude_md(tmp_path):
