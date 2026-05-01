@@ -2031,6 +2031,147 @@ def extract_sql(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
+def extract_terraform(path: Path) -> dict:
+    """Extract resources, modules, data sources, variables, outputs and their cross-references
+    from .tf / .hcl files via tree-sitter-hcl. Supports Terraform-specific reference patterns:
+    `module.x`, `var.y`, `data.x.y`, `local.z`, and `<resource_type>.<name>`."""
+    try:
+        import tree_sitter_hcl as tshcl
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return {"nodes": [], "edges": [], "error": "tree_sitter_hcl not installed. Run: pip install tree-sitter-hcl"}
+
+    try:
+        language = Language(tshcl.language())
+        parser = Parser(language)
+        source = path.read_bytes()
+        tree = parser.parse(source)
+        root = tree.root_node
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    str_path = str(path)
+    file_nid = _make_id(str_path)
+    nodes: list[dict] = [{"id": file_nid, "label": path.name, "file_type": "code",
+                          "source_file": str_path, "source_location": None}]
+    edges: list[dict] = []
+    seen_ids: set[str] = {file_nid}
+
+    def _read(n) -> str:
+        return source[n.start_byte:n.end_byte].decode("utf-8", errors="replace")
+
+    def _strip_quotes(s: str) -> str:
+        s = s.strip()
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+            return s[1:-1]
+        return s
+
+    def _ensure_node(nid: str, label: str, line: int) -> None:
+        if nid not in seen_ids:
+            seen_ids.add(nid)
+            nodes.append({"id": nid, "label": label, "file_type": "code",
+                          "source_file": str_path, "source_location": f"L{line}" if line else None})
+
+    def _add_edge(src: str, tgt: str, relation: str, line: int) -> None:
+        edges.append({"source": src, "target": tgt, "relation": relation,
+                      "confidence": "EXTRACTED", "source_file": str_path,
+                      "source_location": f"L{line}", "weight": 1.0})
+
+    _BLOCK_TYPES = {"resource", "module", "data", "variable", "output", "locals",
+                    "provider", "terraform", "check"}
+    _REF_PATTERNS = [
+        (re.compile(r"\bmodule\.([A-Za-z_][\w-]*)\b"), "uses_module", "module"),
+        (re.compile(r"\bvar\.([A-Za-z_][\w-]*)\b"), "uses_var", "var"),
+        (re.compile(r"\bdata\.([A-Za-z_][\w-]*)\.([A-Za-z_][\w-]*)\b"), "uses_data", "data"),
+        (re.compile(r"\blocal\.([A-Za-z_][\w-]*)\b"), "uses_local", "local"),
+    ]
+    _RESOURCE_REF = re.compile(r"\b([a-z][a-z0-9_]+\.[A-Za-z_][\w-]+)\.[A-Za-z_]")
+    _NON_RESOURCE_PREFIXES = {"module", "var", "data", "local", "self", "each", "count", "path", "terraform"}
+
+    def walk(node) -> None:
+        if node.type == "block":
+            named = [c for c in node.children if c.is_named]
+            if not named or named[0].type != "identifier":
+                for c in node.children:
+                    walk(c)
+                return
+            block_type_node = named[0]
+            block_type = _read(block_type_node)
+            if block_type not in _BLOCK_TYPES:
+                for c in node.children:
+                    walk(c)
+                return
+
+            labels: list[str] = []
+            for c in node.children:
+                if c.type == "string_lit":
+                    labels.append(_strip_quotes(_read(c)).strip("\""))
+
+            line = node.start_point[0] + 1
+            if block_type == "resource" and len(labels) >= 2:
+                block_id = _make_id("tf", labels[0], labels[1])
+                block_label = f"{labels[0]}.{labels[1]}"
+            elif block_type == "module" and labels:
+                block_id = _make_id("tf_module", labels[0])
+                block_label = f"module.{labels[0]}"
+            elif block_type == "data" and len(labels) >= 2:
+                block_id = _make_id("tf_data", labels[0], labels[1])
+                block_label = f"data.{labels[0]}.{labels[1]}"
+            elif block_type == "variable" and labels:
+                block_id = _make_id("tf_var", labels[0])
+                block_label = f"var.{labels[0]}"
+            elif block_type == "output" and labels:
+                block_id = _make_id("tf_output", labels[0])
+                block_label = f"output.{labels[0]}"
+            else:
+                block_id = _make_id("tf", block_type, *labels)
+                block_label = block_type + ("." + ".".join(labels) if labels else "")
+
+            _ensure_node(block_id, block_label, line)
+            _add_edge(file_nid, block_id, "contains", line)
+
+            body_text = _read(node)
+            for pattern, rel, kind in _REF_PATTERNS:
+                for m in pattern.finditer(body_text):
+                    if kind == "module":
+                        tid = _make_id("tf_module", m.group(1))
+                        tlabel = f"module.{m.group(1)}"
+                    elif kind == "var":
+                        tid = _make_id("tf_var", m.group(1))
+                        tlabel = f"var.{m.group(1)}"
+                    elif kind == "data":
+                        tid = _make_id("tf_data", m.group(1), m.group(2))
+                        tlabel = f"data.{m.group(1)}.{m.group(2)}"
+                    elif kind == "local":
+                        tid = _make_id("tf_local", m.group(1))
+                        tlabel = f"local.{m.group(1)}"
+                    else:
+                        continue
+                    if tid != block_id:
+                        _ensure_node(tid, tlabel, 0)
+                        _add_edge(block_id, tid, rel, line)
+
+            for m in _RESOURCE_REF.finditer(body_text):
+                ref_target = m.group(1)
+                parts = ref_target.split(".")
+                if len(parts) != 2:
+                    continue
+                type_part, name_part = parts
+                if type_part in _NON_RESOURCE_PREFIXES:
+                    continue
+                tid = _make_id("tf", type_part, name_part)
+                if tid != block_id:
+                    _ensure_node(tid, ref_target, 0)
+                    _add_edge(block_id, tid, "references_resource", line)
+            return
+
+        for c in node.children:
+            walk(c)
+
+    walk(root)
+    return {"nodes": nodes, "edges": edges}
+
+
 def extract_lua(path: Path) -> dict:
     """Extract functions, methods, require() imports, and calls from a .lua file."""
     return _extract_generic(path, _LUA_CONFIG)
@@ -3688,6 +3829,8 @@ _DISPATCH: dict[str, Any] = {
     ".v": extract_verilog,
     ".sv": extract_verilog,
     ".sql": extract_sql,
+    ".tf": extract_terraform,
+    ".hcl": extract_terraform,
 }
 
 
@@ -3849,6 +3992,7 @@ def extract(
     root = root.resolve()
 
     effective_root = cache_root or root
+
     total = len(paths)
 
     # Phase 1: separate cached hits from uncached work
@@ -4008,6 +4152,7 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
         ".rb", ".cs", ".kt", ".kts", ".scala", ".php", ".swift",
         ".lua", ".toc", ".zig", ".ps1",
         ".m", ".mm",
+        ".sql", ".tf", ".hcl",
     }
     from graphify.detect import _load_graphifyignore, _is_ignored
     ignore_root = root if root is not None else target

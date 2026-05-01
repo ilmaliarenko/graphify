@@ -52,7 +52,9 @@ office = ["python-docx", "openpyxl"]
 video = ["faster-whisper", "yt-dlp"]
 kimi = ["openai", "tiktoken"]
 sql = ["tree-sitter-sql"]
-all = ["mcp", "neo4j", "pypdf", "markdownify", "watchdog", "graspologic; python_version < '3.13'", "python-docx", "openpyxl", "faster-whisper", "yt-dlp", "matplotlib", "openai", "tiktoken", "tree-sitter-sql"]
+terraform = ["tree-sitter-hcl"]
+dbt = ["tree-sitter-jinja"]
+all = ["mcp", "neo4j", "pypdf", "markdownify", "watchdog", "graspologic; python_version < '3.13'", "python-docx", "openpyxl", "faster-whisper", "yt-dlp", "matplotlib", "openai", "tiktoken", "tree-sitter-sql", "tree-sitter-hcl", "tree-sitter-jinja"]
 
 [project.scripts]
 graphify = "graphify.__main__:main"
