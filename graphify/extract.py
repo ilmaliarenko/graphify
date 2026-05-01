@@ -3926,15 +3926,12 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
 def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | None = None) -> list[Path]:
     if target.is_file():
         return [target]
-    _EXTENSIONS = {
-        ".py", ".js", ".ts", ".tsx", ".go", ".rs",
-        ".java", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp",
-        ".rb", ".cs", ".kt", ".kts", ".scala", ".php", ".swift",
-        ".lua", ".toc", ".zig", ".ps1",
-        ".m", ".mm",
-        ".sql", ".tf", ".hcl",
-    }
-    from graphify.detect import _load_graphifyignore, _is_ignored
+    from graphify.detect import _load_graphifyignore, _is_ignored, CODE_EXTENSIONS
+    # Derive from CODE_EXTENSIONS so this set never drifts behind the canonical
+    # list in detect.py (historically it had to be updated by hand and silently
+    # missed `.dart`, `.ejs`, `.ex`, `.exs`, `.jl`, `.jsx`, `.mjs`, `.sv`,
+    # `.svelte`, `.v`, `.vue`).
+    _EXTENSIONS = set(CODE_EXTENSIONS)
     ignore_root = root if root is not None else target
     patterns = _load_graphifyignore(ignore_root)
 
