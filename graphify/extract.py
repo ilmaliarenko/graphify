@@ -1900,8 +1900,158 @@ def extract_verilog(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
+_DBT_PROJECT_CACHE: dict[str, bool] = {}
+
+
+def _is_dbt_project_file(path: Path) -> bool:
+    """Walk up parents looking for a `dbt_project.yml` to decide if `path` belongs
+    to a dbt project. Result cached per-directory to avoid repeated stat() calls
+    when many .sql files share ancestors."""
+    try:
+        parent = path.parent.resolve()
+    except OSError:
+        return False
+    key = str(parent)
+    if key in _DBT_PROJECT_CACHE:
+        return _DBT_PROJECT_CACHE[key]
+    cur = parent
+    seen: list[str] = []
+    found = False
+    while True:
+        seen.append(str(cur))
+        if (cur / "dbt_project.yml").exists():
+            found = True
+            break
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    for s in seen:
+        _DBT_PROJECT_CACHE[s] = found
+    return found
+
+
+_DBT_FNS = {"ref", "source", "var", "config"}
+
+
+def extract_dbt_sql(path: Path) -> dict:
+    """Extract dbt model lineage from a .sql file by parsing it as Jinja2.
+    Emits edges for `ref('x')` (relation `references`),
+    `source('s','t')` (`references_source`), `var('v')` (`uses_var`).
+    `config(...)` kwargs (alias, materialized) become attributes on the file node.
+
+    Used by `extract_sql` when the file lives inside a dbt project (parent dir
+    chain contains `dbt_project.yml`) or when Jinja markers (`{{` or `{%`) are
+    detected in the source. Falls back gracefully when `tree-sitter-jinja` is not
+    installed — caller should retry with `extract_sql`'s plain-SQL path."""
+    try:
+        import tree_sitter_jinja as tsj
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return {"nodes": [], "edges": [], "error": "tree_sitter_jinja not installed. Run: pip install tree-sitter-jinja"}
+
+    try:
+        language = Language(tsj.language())
+        parser = Parser(language)
+        source = path.read_bytes()
+        tree = parser.parse(source)
+        root = tree.root_node
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    str_path = str(path)
+    file_nid = _make_id(path.stem)
+    file_node: dict = {"id": file_nid, "label": path.stem, "file_type": "code",
+                       "source_file": str_path, "source_location": "L1"}
+    nodes: list[dict] = [file_node]
+    edges: list[dict] = []
+    seen_targets: set[str] = set()
+
+    def _read(n) -> str:
+        return source[n.start_byte:n.end_byte].decode("utf-8", errors="replace")
+
+    def _strip_quotes(s: str) -> str:
+        s = s.strip()
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+            return s[1:-1]
+        return s
+
+    def _add_target_node_and_edge(target_id: str, label: str, relation: str, line: int) -> None:
+        if target_id in seen_targets:
+            return
+        seen_targets.add(target_id)
+        nodes.append({"id": target_id, "label": label, "file_type": "code",
+                      "source_file": "", "source_location": ""})
+        edges.append({"source": file_nid, "target": target_id, "relation": relation,
+                      "confidence": "EXTRACTED", "source_file": str_path,
+                      "source_location": f"L{line}", "weight": 1.0})
+
+    def walk(node) -> None:
+        if node.type in ("call", "fn_call"):
+            named = [c for c in node.children if c.is_named]
+            if named:
+                fn_name = _read(named[0]).strip()
+                if fn_name in _DBT_FNS:
+                    args: list[str] = []
+                    stack = [node]
+                    while stack:
+                        n2 = stack.pop()
+                        if n2.type in ("lit_string", "string", "string_literal"):
+                            args.append(_strip_quotes(_read(n2)))
+                        else:
+                            stack.extend(n2.children)
+                    line = node.start_point[0] + 1
+                    if fn_name == "ref" and args:
+                        target = args[0]
+                        _add_target_node_and_edge(_make_id(target), target, "references", line)
+                    elif fn_name == "source" and len(args) >= 2:
+                        schema, table = args[0], args[1]
+                        _add_target_node_and_edge(
+                            _make_id("source", schema, table),
+                            f"{schema}.{table}",
+                            "references_source",
+                            line,
+                        )
+                    elif fn_name == "var" and args:
+                        _add_target_node_and_edge(
+                            _make_id("var", args[0]),
+                            f"var.{args[0]}",
+                            "uses_var",
+                            line,
+                        )
+                    elif fn_name == "config":
+                        cfg_text = _read(node)
+                        m = re.search(r"alias\s*=\s*['\"]([^'\"]+)['\"]", cfg_text)
+                        if m:
+                            file_node["dbt_alias"] = m.group(1)
+                        m = re.search(r"materialized\s*=\s*['\"]([^'\"]+)['\"]", cfg_text)
+                        if m:
+                            file_node["dbt_materialized"] = m.group(1)
+        for c in node.children:
+            walk(c)
+
+    walk(root)
+    return {"nodes": nodes, "edges": edges}
+
+
 def extract_sql(path: Path) -> dict:
-    """Extract tables, views, functions, and relationships from .sql files via tree-sitter."""
+    """Extract tables, views, functions, and relationships from .sql files via tree-sitter.
+
+    When the file lives inside a dbt project (a `dbt_project.yml` sits in any parent
+    directory) or contains Jinja markers (`{{` or `{%`), routes to `extract_dbt_sql`
+    which understands ref()/source()/var()/config(). Falls back to the plain
+    tree-sitter-sql path when `tree-sitter-jinja` is unavailable."""
+    try:
+        source_peek = path.read_bytes()
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    looks_dbt = _is_dbt_project_file(path) or b"{{" in source_peek or b"{%" in source_peek
+    if looks_dbt:
+        result = extract_dbt_sql(path)
+        if "error" not in result or "tree_sitter_jinja not installed" not in result.get("error", ""):
+            return result
+        # Fall through to plain SQL extractor when jinja parser is missing
+
     try:
         import tree_sitter_sql as tssql
         from tree_sitter import Language, Parser

@@ -864,3 +864,92 @@ def test_terraform_hcl_extension_uses_same_extractor():
     # _DISPATCH is built inside extract(); recreate the relevant assertion via _EXTENSIONS
     # The actual dispatcher binding is tested implicitly via collect_files semantics.
     assert hasattr(_ex, "extract_terraform")
+
+
+# ── dbt SQL (Jinja-aware) ────────────────────────────────────────────────────
+
+from graphify.extract import extract_dbt_sql, extract_sql, _is_dbt_project_file
+
+
+def test_dbt_sql_no_error():
+    r = extract_dbt_sql(FIXTURES / "sample_dbt.sql")
+    assert "error" not in r, r.get("error")
+
+
+def test_dbt_sql_finds_ref_edges():
+    r = extract_dbt_sql(FIXTURES / "sample_dbt.sql")
+    refs = [e for e in r["edges"] if e["relation"] == "references"]
+    targets = {e["target"] for e in refs}
+    assert "stg_orders" in targets
+    assert "stg_promotions" in targets
+
+
+def test_dbt_sql_finds_source_edge():
+    r = extract_dbt_sql(FIXTURES / "sample_dbt.sql")
+    src_edges = [e for e in r["edges"] if e["relation"] == "references_source"]
+    assert any("book_catalog" in e["target"] for e in src_edges)
+
+
+def test_dbt_sql_finds_var_edge():
+    r = extract_dbt_sql(FIXTURES / "sample_dbt.sql")
+    var_edges = [e for e in r["edges"] if e["relation"] == "uses_var"]
+    assert any("window_start" in e["target"] for e in var_edges)
+
+
+def test_dbt_sql_extracts_config_attrs():
+    r = extract_dbt_sql(FIXTURES / "sample_dbt.sql")
+    file_node = r["nodes"][0]
+    assert file_node.get("dbt_alias") == "daily_book_sales"
+    assert file_node.get("dbt_materialized") == "table"
+
+
+def test_dbt_sql_no_dangling_edges():
+    r = extract_dbt_sql(FIXTURES / "sample_dbt.sql")
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in node_ids, f"Dangling source: {e}"
+        assert e["target"] in node_ids, f"Dangling target: {e}"
+
+
+def test_extract_sql_dispatches_to_dbt_when_jinja_markers_present():
+    """extract_sql should detect Jinja `{{` / `{%` and route to extract_dbt_sql,
+    even when the file is not in a dbt project (no dbt_project.yml in parents)."""
+    r = extract_sql(FIXTURES / "sample_dbt.sql")
+    assert "error" not in r, r.get("error")
+    assert any(e["relation"] == "references" for e in r["edges"])
+
+
+def test_extract_sql_dispatches_to_dbt_when_in_dbt_project(tmp_path):
+    """extract_sql should detect dbt_project.yml in parents and route to extract_dbt_sql
+    even for files without Jinja markers (defensive — most dbt files have refs)."""
+    (tmp_path / "dbt_project.yml").write_text("name: test_project\nversion: '1.0'\n")
+    sql = tmp_path / "models" / "my_model.sql"
+    sql.parent.mkdir()
+    sql.write_text("select * from {{ ref('upstream') }}\n")
+    r = extract_sql(sql)
+    assert "error" not in r, r.get("error")
+    assert any(e["relation"] == "references" and e["target"] == "upstream" for e in r["edges"])
+
+
+def test_extract_sql_keeps_plain_sql_path_when_no_jinja_no_dbt():
+    """A pure SQL file (no Jinja, no dbt project) should still go through the
+    upstream tree-sitter-sql extractor — we must not regress its behaviour."""
+    r = extract_sql(FIXTURES / "sample.sql")
+    assert "error" not in r, r.get("error")
+    # Plain SQL path emits "contains" edges from file → table; dbt path doesn't.
+    rels = {e["relation"] for e in r["edges"]}
+    assert "contains" in rels, "fell through to dbt path on plain SQL — should have used tree-sitter-sql"
+
+
+def test_is_dbt_project_file_detects_parent_marker(tmp_path):
+    (tmp_path / "dbt_project.yml").write_text("name: test\n")
+    sql = tmp_path / "models" / "deep" / "x.sql"
+    sql.parent.mkdir(parents=True)
+    sql.write_text("select 1")
+    assert _is_dbt_project_file(sql) is True
+
+
+def test_is_dbt_project_file_returns_false_when_no_marker(tmp_path):
+    sql = tmp_path / "x.sql"
+    sql.write_text("select 1")
+    assert _is_dbt_project_file(sql) is False
