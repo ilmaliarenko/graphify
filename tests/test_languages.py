@@ -953,3 +953,90 @@ def test_is_dbt_project_file_returns_false_when_no_marker(tmp_path):
     sql = tmp_path / "x.sql"
     sql.write_text("select 1")
     assert _is_dbt_project_file(sql) is False
+
+
+# ── dbt YAML schema extractor ────────────────────────────────────────────────
+
+from graphify.extract import extract_dbt_yaml
+
+
+def test_dbt_yaml_no_error():
+    r = extract_dbt_yaml(FIXTURES / "sample_dbt_schema.yml")
+    assert "error" not in r, r.get("error")
+
+
+def test_dbt_yaml_finds_models():
+    r = extract_dbt_yaml(FIXTURES / "sample_dbt_schema.yml")
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "documents"}
+    assert "daily_book_sales" in targets
+    assert "monthly_top_authors" in targets
+
+
+def test_dbt_yaml_finds_sources():
+    r = extract_dbt_yaml(FIXTURES / "sample_dbt_schema.yml")
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "defines_source"}
+    # Both the source-level name "warehouse" and the per-table names land here
+    assert any("warehouse" in t for t in targets)
+    assert any("book_catalog" in t for t in targets)
+    assert any("orders_log" in t for t in targets)
+
+
+def test_dbt_yaml_finds_seeds():
+    r = extract_dbt_yaml(FIXTURES / "sample_dbt_schema.yml")
+    targets = {e["target"] for e in r["edges"] if e["relation"] == "defines_seed"}
+    assert any("ref_genres" in t for t in targets)
+
+
+def test_dbt_yaml_skips_columns_and_tests():
+    """The extractor must NOT mistake column names ('book_isbn', 'revenue', etc.)
+    for model definitions — they live under per-entity `columns:` keys, which
+    are explicit leaves we skip."""
+    r = extract_dbt_yaml(FIXTURES / "sample_dbt_schema.yml")
+    docs = {e["target"] for e in r["edges"] if e["relation"] == "documents"}
+    assert "book_isbn" not in docs
+    assert "revenue" not in docs
+    assert "rank" not in docs
+    assert "author" not in docs
+
+
+def test_dbt_yaml_model_id_matches_extract_dbt_sql():
+    """A model `name: daily_book_sales` in YAML must produce the same node id
+    as the corresponding `daily_book_sales.sql` file would — that's the merge
+    contract: docs node and code node collapse into one."""
+    yaml_r = extract_dbt_yaml(FIXTURES / "sample_dbt_schema.yml")
+    yaml_targets = {e["target"] for e in yaml_r["edges"] if e["relation"] == "documents"}
+    # extract_dbt_sql on sample_dbt.sql uses _make_id(path.stem) for the file node
+    sql_r = extract_dbt_sql(FIXTURES / "sample_dbt.sql")
+    sql_file_id = sql_r["nodes"][0]["id"]
+    assert sql_file_id == "sample_dbt"
+    # And refs in the SQL produce ids compatible with model targets in YAML
+    refs = {e["target"] for e in sql_r["edges"] if e["relation"] == "references"}
+    # The bookstore fixtures don't cross-reference — verify the ID convention
+    # is consistent by running both on a synthetic name
+    from graphify.extract import _make_id
+    assert _make_id("daily_book_sales") in yaml_targets
+
+
+def test_dbt_yaml_no_dangling_edges():
+    r = extract_dbt_yaml(FIXTURES / "sample_dbt_schema.yml")
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in node_ids, f"Dangling source: {e}"
+        assert e["target"] in node_ids, f"Dangling target: {e}"
+
+
+def test_dbt_yaml_handles_jinja_templated_names_gracefully():
+    """`name: {{ var('x') }}` must NOT produce a literal node — the extractor
+    treats Jinja-templated names as 'unknown' and skips them, since the real
+    name is only resolvable at compile time."""
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+        f.write("version: 2\nmodels:\n  - name: \"{{ var('x') }}\"\n")
+        tmp_path = f.name
+    try:
+        r = extract_dbt_yaml(Path(tmp_path))
+        for n in r["nodes"]:
+            assert "{{" not in n["label"]
+            assert "{{" not in n["id"]
+    finally:
+        os.unlink(tmp_path)

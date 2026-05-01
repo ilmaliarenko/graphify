@@ -1742,12 +1742,27 @@ def main() -> None:
             else:
                 i += 1
 
-        from graphify.extract import collect_files, extract
+        from graphify.extract import collect_files, extract, _is_dbt_project_file
 
         if target.is_file():
             files = [target]
         else:
             files = collect_files(target)
+            # In a dbt project context, also discover .yml / .yaml schema files
+            # (they're not in CODE_EXTENSIONS so collect_files skips them; the
+            # dbt YAML extractor handles them safely on its own).
+            probe = target if target.is_dir() else target.parent
+            if (probe / "dbt_project.yml").exists() or _is_dbt_project_file(probe / "_probe"):
+                yaml_files = list(target.rglob("*.yml")) + list(target.rglob("*.yaml"))
+                # Skip noise (venv, dbt_packages, target, .git, graphify-out)
+                _NOISE = ("/venv/", "/.venv/", "/dbt_packages/", "/target/",
+                           "/.git/", "/graphify-out/", "/node_modules/",
+                           "/__pycache__/")
+                yaml_files = [p for p in yaml_files
+                              if not any(noise in str(p) for noise in _NOISE)]
+                # De-dupe against files already discovered
+                already = {str(p) for p in files}
+                files.extend(p for p in yaml_files if str(p) not in already)
 
         if not files:
             print(json.dumps({"nodes": [], "edges": [], "warning": "no code files found",
