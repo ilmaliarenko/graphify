@@ -4750,6 +4750,19 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
         # the bridges_to edge tags but never block the pipeline.
         pass
 
+    # Recency stamp — give every node/edge an `extracted_at` (unix seconds)
+    # if it doesn't have one already.  Cached results carry their original
+    # timestamp from when the file was first extracted, so this gives us a
+    # real "when did the graph learn about this entity" signal usable by
+    # `graphify diff`, `graphify reflect`, and recency-aware ranking in
+    # `graphify context`.  Stamp is per-item, idempotent, and never overwrites
+    # existing values.
+    import time as _time
+    _now = int(_time.time())
+    for item in all_nodes + all_edges:
+        if "extracted_at" not in item:
+            item["extracted_at"] = _now
+
     return {
         "nodes": all_nodes,
         "edges": all_edges,
