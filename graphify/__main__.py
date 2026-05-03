@@ -1093,6 +1093,15 @@ def main() -> None:
         print("  dbt-manifest <manifest.json>  convert dbt target/manifest.json to graph.json (env-resolved lineage)")
         print("    --out PATH              output path (default: stdout)")
         print("    --project-root DIR      resolve manifest paths against this dir")
+        print("  search \"<query>\"        fast substring/keyword lookup across node labels + key attrs (LLM memory, plan-mode-safe)")
+        print("    --limit N               top-K results (default 10)")
+        print("    --no-neighbors          skip the 1-hop neighbor expansion")
+        print("    --graph PATH            path to graph.json (default graphify-out/graph.json)")
+        print("  context \"<task>\"        token-budgeted subgraph for LLM prompt injection (BFS from query-matching seeds)")
+        print("    --budget N              approx token budget for the subgraph (default 2000)")
+        print("    --max-hops N            BFS depth from seeds (default 2)")
+        print("  diff [--since 1h|24h|7d|<sec>]  what's new in memory since N (default 24h) — uses extracted_at timestamps")
+        print("  reflect [--top N]       memory state summary: god nodes, recent additions, AMBIGUOUS edges, breakdowns")
         print("  hook install            install post-commit/post-checkout git hooks (all platforms)")
         print("  hook uninstall          remove git hooks")
         print("  hook status             check if git hooks are installed")
@@ -1713,6 +1722,111 @@ def main() -> None:
                 pass
         result = run_benchmark(graph_path, corpus_words=corpus_words)
         print_benchmark(result)
+
+    elif cmd in ("search", "context", "diff", "reflect"):
+        # LLM-memory utilities — pure read on graph.json, plan-mode-safe.
+        from graphify.memory import load_graph, search as _search, context as _context, diff as _diff, reflect as _reflect
+
+        graph_path = "graphify-out/graph.json"
+        # Parse common --graph flag first
+        rest = sys.argv[2:]
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--graph" and i + 1 < len(rest):
+                graph_path = rest[i + 1]
+                rest.pop(i); rest.pop(i)
+            else:
+                i += 1
+
+        try:
+            graph = load_graph(graph_path)
+        except FileNotFoundError as e:
+            print(f"error: {e}", file=sys.stderr)
+            print("Run /graphify <path> first to build the graph.", file=sys.stderr)
+            sys.exit(1)
+
+        if cmd == "search":
+            if not rest or rest[0] in ("-h", "--help"):
+                print("Usage: graphify search \"<query>\" [--limit N] [--no-neighbors] [--graph PATH]", file=sys.stderr)
+                sys.exit(2)
+            query = rest[0]
+            limit = 10
+            include_neighbors = True
+            i = 1
+            while i < len(rest):
+                if rest[i] == "--limit" and i + 1 < len(rest):
+                    limit = int(rest[i + 1]); i += 2
+                elif rest[i] == "--no-neighbors":
+                    include_neighbors = False; i += 1
+                else:
+                    i += 1
+            result = _search(graph, query, limit=limit, include_neighbors=include_neighbors)
+            print(json.dumps(result, indent=2, default=str), flush=True)
+
+        elif cmd == "context":
+            if not rest or rest[0] in ("-h", "--help"):
+                print("Usage: graphify context \"<task>\" [--budget N] [--max-hops N] [--graph PATH]", file=sys.stderr)
+                print("  --budget N      approx token budget for the returned subgraph (default 2000)", file=sys.stderr)
+                print("  --max-hops N    BFS depth from seed nodes (default 2)", file=sys.stderr)
+                sys.exit(2)
+            query = rest[0]
+            budget = 2000
+            max_hops = 2
+            i = 1
+            while i < len(rest):
+                if rest[i] == "--budget" and i + 1 < len(rest):
+                    budget = int(rest[i + 1]); i += 2
+                elif rest[i] == "--max-hops" and i + 1 < len(rest):
+                    max_hops = int(rest[i + 1]); i += 2
+                else:
+                    i += 1
+            result = _context(graph, query, budget_tokens=budget, max_hops=max_hops)
+            print(json.dumps(result, indent=2, default=str), flush=True)
+
+        elif cmd == "diff":
+            # Default: last 24 hours
+            since = "24h"
+            i = 0
+            while i < len(rest):
+                if rest[i] == "--since" and i + 1 < len(rest):
+                    since = rest[i + 1]; i += 2
+                elif rest[i] in ("-h", "--help"):
+                    print("Usage: graphify diff [--since 1h|24h|7d|<seconds>] [--graph PATH]", file=sys.stderr)
+                    sys.exit(2)
+                else:
+                    i += 1
+            # Parse since: accepts "1h", "24h", "7d", or raw seconds
+            unit = since[-1].lower()
+            try:
+                if unit == "h":
+                    since_seconds = int(since[:-1]) * 3600
+                elif unit == "d":
+                    since_seconds = int(since[:-1]) * 86400
+                elif unit == "m" and since.endswith("min"):
+                    since_seconds = int(since[:-3]) * 60
+                elif unit == "m":
+                    since_seconds = int(since[:-1]) * 60
+                else:
+                    since_seconds = int(since)
+            except ValueError:
+                print(f"error: invalid --since value '{since}' (use 1h / 24h / 7d / seconds)", file=sys.stderr)
+                sys.exit(2)
+            result = _diff(graph, since_seconds=since_seconds)
+            print(json.dumps(result, indent=2, default=str), flush=True)
+
+        elif cmd == "reflect":
+            top_k = 10
+            i = 0
+            while i < len(rest):
+                if rest[i] == "--top" and i + 1 < len(rest):
+                    top_k = int(rest[i + 1]); i += 2
+                elif rest[i] in ("-h", "--help"):
+                    print("Usage: graphify reflect [--top N] [--graph PATH]", file=sys.stderr)
+                    sys.exit(2)
+                else:
+                    i += 1
+            result = _reflect(graph, top_k=top_k)
+            print(json.dumps(result, indent=2, default=str), flush=True)
 
     elif cmd == "dbt-manifest":
         # Convert dbt's `target/manifest.json` (produced by `dbt parse`) to
