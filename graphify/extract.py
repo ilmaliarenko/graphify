@@ -1975,13 +1975,171 @@ def extract_dbt_yaml(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
+_SNOWFLAKE_DDL_SIGNATURES = re.compile(
+    r"\bCREATE\s+(OR\s+REPLACE\s+)?(MASKING\s+POLICY|PIPE|STAGE|STREAM|TASK|EXTERNAL\s+TABLE|FILE\s+FORMAT|NETWORK\s+RULE|NETWORK\s+POLICY|STORAGE\s+INTEGRATION|NOTIFICATION\s+INTEGRATION|API\s+INTEGRATION|SECURITY\s+INTEGRATION|TAG)\b"
+    r"|\bAPPLY\s+(MASKING\s+POLICY|TAG)\b"
+    r"|\bUSE\s+ROLE\b"
+    r"|\bGRANT\s+\S+\s+ON\b"
+    r"|\bCREATE\s+ROLE\b",
+    re.IGNORECASE,
+)
+
+
+def _is_snowflake_ddl(source: str) -> bool:
+    """Heuristic: does this SQL look like Snowflake admin/governance DDL?
+    (masking policies, pipes, grants, integrations) rather than dbt model SQL?"""
+    return bool(_SNOWFLAKE_DDL_SIGNATURES.search(source))
+
+
+def extract_snowflake_ddl(path: Path) -> dict:
+    """Extract Snowflake admin/governance DDL: masking policies, pipes,
+    streams, tasks, integrations, grants, roles. All edges are EXTRACTED
+    because they're line-pattern matches, not inference.
+
+    Designed for files like `apply_masking_*.sql`, `create_grant_*.sql`,
+    `create_pipe_*.sql` — pure Snowflake admin scripts, NOT dbt models.
+    `extract_sql` routes here when it detects Snowflake DDL signatures
+    AND no Jinja markers AND not in a dbt project context.
+    """
+    try:
+        source_text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    str_path = str(path)
+    file_nid = _make_id("snowflake_ddl", path.stem)
+    nodes: list[dict] = [{"id": file_nid, "label": path.name, "file_type": "code",
+                          "source_file": str_path, "source_location": "L1"}]
+    edges: list[dict] = []
+    seen_ids: set[str] = {file_nid}
+
+    def _ensure(nid: str, label: str, line: int, **extras) -> None:
+        if nid in seen_ids:
+            return
+        seen_ids.add(nid)
+        n = {"id": nid, "label": label, "file_type": "code",
+             "source_file": str_path, "source_location": f"L{line}"}
+        for k, v in extras.items():
+            if v is not None:
+                n[k] = v
+        nodes.append(n)
+
+    def _edge(src: str, tgt: str, relation: str, line: int) -> None:
+        edges.append({"source": src, "target": tgt, "relation": relation,
+                      "confidence": "EXTRACTED", "source_file": str_path,
+                      "source_location": f"L{line}", "weight": 1.0})
+
+    def _line_no(pos: int) -> int:
+        return source_text.count("\n", 0, pos) + 1
+
+    def _norm_table(ref: str) -> str:
+        """Normalize a Snowflake table ref `DB.SCHEMA.TABLE` to a canonical id.
+        Handles missing DB (defaults to `*`), strips quotes, uppercases."""
+        cleaned = re.sub(r'["`\s]', "", ref)
+        parts = cleaned.upper().split(".")
+        if len(parts) == 3:
+            return _make_id("snowflake_table", parts[0], parts[1], parts[2])
+        if len(parts) == 2:
+            return _make_id("snowflake_table", parts[0], parts[1])
+        return _make_id("snowflake_table", parts[-1])
+
+    # ── 1. CREATE OR REPLACE MASKING POLICY DB.SCHEMA.NAME ──
+    for m in re.finditer(
+        r"\bCREATE\s+(?:OR\s+REPLACE\s+)?MASKING\s+POLICY\s+([A-Za-z0-9_.\"`]+)",
+        source_text, re.IGNORECASE,
+    ):
+        ref = m.group(1)
+        line = _line_no(m.start())
+        nid = _make_id("snowflake_masking_policy", *re.split(r"[.]", re.sub(r'["`]', "", ref)))
+        _ensure(nid, f"masking_policy: {ref}", line=line,
+                snowflake_object="masking_policy", snowflake_qualified_name=ref)
+        _edge(file_nid, nid, "defines_masking_policy", line)
+
+    # ── 2. CREATE OR REPLACE FUNCTION DB.SCHEMA.NAME(args) ──
+    for m in re.finditer(
+        r"\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+([A-Za-z0-9_.\"`]+)\s*\(",
+        source_text, re.IGNORECASE,
+    ):
+        ref = m.group(1)
+        line = _line_no(m.start())
+        nid = _make_id("snowflake_function", *re.split(r"[.]", re.sub(r'["`]', "", ref)))
+        _ensure(nid, f"function: {ref}", line=line,
+                snowflake_object="function", snowflake_qualified_name=ref)
+        _edge(file_nid, nid, "defines_function", line)
+
+    # ── 3. CREATE OR REPLACE PIPE DB.SCHEMA.NAME ──
+    for m in re.finditer(
+        r"\bCREATE\s+(?:OR\s+REPLACE\s+)?PIPE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_.\"`]+)",
+        source_text, re.IGNORECASE,
+    ):
+        ref = m.group(1)
+        line = _line_no(m.start())
+        nid = _make_id("snowflake_pipe", *re.split(r"[.]", re.sub(r'["`]', "", ref)))
+        _ensure(nid, f"pipe: {ref}", line=line,
+                snowflake_object="pipe", snowflake_qualified_name=ref)
+        _edge(file_nid, nid, "defines_pipe", line)
+
+    # ── 4. CREATE ROLE [IF NOT EXISTS] name ──
+    for m in re.finditer(
+        r"\bCREATE\s+ROLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z0-9_\"`]+)",
+        source_text, re.IGNORECASE,
+    ):
+        role = re.sub(r'["`]', "", m.group(1))
+        line = _line_no(m.start())
+        nid = _make_id("snowflake_role", role)
+        _ensure(nid, f"role: {role}", line=line, snowflake_object="role")
+        _edge(file_nid, nid, "defines_role", line)
+
+    # ── 5. ALTER TABLE DB.SCHEMA.TABLE ... SET MASKING POLICY DB.SCHEMA.POLICY ──
+    # Multi-line capture: ALTER TABLE T ... blah blah ... SET MASKING POLICY P;
+    for m in re.finditer(
+        r"ALTER\s+TABLE\s+([A-Za-z0-9_.\"`]+)[\s\S]+?SET\s+MASKING\s+POLICY\s+([A-Za-z0-9_.\"`]+)",
+        source_text, re.IGNORECASE,
+    ):
+        table_ref, policy_ref = m.group(1), m.group(2)
+        line = _line_no(m.start())
+        table_nid = _norm_table(table_ref)
+        policy_nid = _make_id("snowflake_masking_policy",
+                              *re.split(r"[.]", re.sub(r'["`]', "", policy_ref)))
+        _ensure(table_nid, table_ref, line=line, snowflake_object="table",
+                snowflake_qualified_name=table_ref)
+        _ensure(policy_nid, f"masking_policy: {policy_ref}", line=line,
+                snowflake_object="masking_policy",
+                snowflake_qualified_name=policy_ref)
+        _edge(table_nid, policy_nid, "applies_masking_policy", line)
+
+    # ── 6. GRANT <privs> ON <object> TO ROLE <name> ──
+    for m in re.finditer(
+        r"\bGRANT\s+(?P<privs>[\w\s,]+?)\s+ON\s+(?P<obj>[\w\s.]+?)\s+TO\s+(?:ROLE\s+|USER\s+)?(?P<grantee>[A-Za-z0-9_\"`]+)",
+        source_text, re.IGNORECASE,
+    ):
+        line = _line_no(m.start())
+        grantee = re.sub(r'["`]', "", m["grantee"])
+        privs = " ".join(m["privs"].split())
+        # Grantee node — could be role or user, treat as role unless USER prefix
+        grantee_nid = _make_id("snowflake_role", grantee)
+        _ensure(grantee_nid, f"role: {grantee}", line=line, snowflake_object="role")
+        # Grant edge from file to role with the privilege as edge attribute
+        edges.append({
+            "source": file_nid, "target": grantee_nid,
+            "relation": "grants_to", "confidence": "EXTRACTED",
+            "source_file": str_path, "source_location": f"L{line}",
+            "weight": 1.0,
+            "snowflake_privileges": privs[:80],
+            "snowflake_grant_object": " ".join(m["obj"].split())[:100],
+        })
+
+    return {"nodes": nodes, "edges": edges}
+
+
 def extract_sql(path: Path) -> dict:
     """Extract tables, views, functions, and relationships from .sql files via tree-sitter.
 
     When the file lives inside a dbt project (a `dbt_project.yml` sits in any parent
     directory) or contains Jinja markers (`{{` or `{%`), routes to `extract_dbt_sql`
-    which understands ref()/source()/var()/config(). Falls back to the plain
-    tree-sitter-sql path when `tree-sitter-jinja` is unavailable."""
+    which understands ref()/source()/var()/config(). When the file looks like
+    Snowflake admin DDL (masking policies, pipes, grants), routes to
+    `extract_snowflake_ddl`. Falls back to the plain tree-sitter-sql path otherwise."""
     try:
         source_peek = path.read_bytes()
     except Exception as e:
@@ -1993,6 +2151,17 @@ def extract_sql(path: Path) -> dict:
         if "error" not in result or "tree_sitter_jinja not installed" not in result.get("error", ""):
             return result
         # Fall through to plain SQL extractor when jinja parser is missing
+
+    # Snowflake admin DDL (masking policies, pipes, grants) — distinct from dbt
+    # model SQL.  Detected by signature in the source.  Cheap regex pass instead
+    # of tree-sitter because Snowflake DDL is line-oriented and the plain SQL
+    # parser doesn't recognize most of these statements anyway.
+    try:
+        source_text = source_peek.decode("utf-8", errors="replace")
+        if _is_snowflake_ddl(source_text):
+            return extract_snowflake_ddl(path)
+    except Exception:
+        pass
 
     try:
         import tree_sitter_sql as tssql

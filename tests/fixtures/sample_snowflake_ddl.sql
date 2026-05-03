@@ -1,0 +1,52 @@
+-- Bookstore governance script — fictional Snowflake admin DDL.
+
+USE ROLE BOOKSTORE_GOVERNANCE_ROLE;
+USE DATABASE BOOKSTORE_DB;
+
+CREATE OR REPLACE FUNCTION GOVERNANCE.mask_email(val VARIANT)
+RETURNS VARIANT
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.10'
+HANDLER = 'mask_email'
+AS
+$$
+def mask_email(val):
+    if isinstance(val, str) and '@' in val:
+        return val.split('@')[0][0] + '***@' + val.split('@')[1]
+    return val
+$$;
+
+CREATE OR REPLACE MASKING POLICY GOVERNANCE.mask_customer_email AS (val STRING)
+RETURNS STRING ->
+    CASE
+        WHEN CURRENT_ROLE() IN ('BOOKSTORE_ANALYST_ROLE') THEN val
+        ELSE GOVERNANCE.mask_email(val)
+    END;
+
+CREATE OR REPLACE MASKING POLICY GOVERNANCE.mask_credit_card AS (val STRING)
+RETURNS STRING ->
+    CASE
+        WHEN CURRENT_ROLE() = 'BOOKSTORE_GOVERNANCE_ROLE' THEN val
+        ELSE '****-****-****-' || RIGHT(val, 4)
+    END;
+
+ALTER TABLE BOOKSTORE_DB.PUBLIC.CUSTOMERS
+    MODIFY COLUMN email
+    SET MASKING POLICY GOVERNANCE.mask_customer_email;
+
+ALTER TABLE BOOKSTORE_DB.PUBLIC.ORDERS
+    MODIFY COLUMN payment_card
+    SET MASKING POLICY GOVERNANCE.mask_credit_card;
+
+CREATE OR REPLACE PIPE BOOKSTORE_DB.RAW_JSON.orders_pipe
+    AUTO_INGEST = TRUE
+AS
+COPY INTO BOOKSTORE_DB.RAW_JSON.ORDERS
+FROM @bookstore_orders_stage
+FILE_FORMAT = (TYPE = JSON);
+
+CREATE ROLE IF NOT EXISTS bookstore_analyst_role;
+
+GRANT USAGE ON SCHEMA BOOKSTORE_DB.PUBLIC TO ROLE bookstore_analyst_role;
+GRANT SELECT ON ALL TABLES IN SCHEMA BOOKSTORE_DB.PUBLIC TO ROLE bookstore_analyst_role;
+GRANT APPLY MASKING POLICY ON ACCOUNT TO ROLE BOOKSTORE_GOVERNANCE_ROLE;
