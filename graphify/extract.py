@@ -2255,6 +2255,515 @@ def extract_terraform(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
+# ── Airflow / Astronomer Cosmos ───────────────────────────────────────────────
+
+_AIRFLOW_IMPORT_MARKERS = (
+    b"from airflow", b"import airflow",
+    b"from cosmos", b"import cosmos",
+    b"from astronomer", b"import astronomer",
+)
+_AIRFLOW_OPERATOR_SUFFIXES = ("Operator", "Sensor")
+_AIRFLOW_TASKGROUP_NAMES = {"TaskGroup", "DbtTaskGroup"}
+_AIRFLOW_DAG_NAMES = {"DAG", "DbtDag"}
+
+
+def _is_airflow_file(source: bytes) -> bool:
+    """Cheap test: does this Python file mention an airflow / cosmos import in its
+    head?  Only DAG files will."""
+    head = source[:5000]
+    return any(marker in head for marker in _AIRFLOW_IMPORT_MARKERS)
+
+
+def extract_airflow_dag(path: Path) -> dict:
+    """Extract Airflow / Astronomer Cosmos DAG structure from a .py file:
+    DAGs, tasks, task dependencies (`>>`/`<<`/`chain()`), Cosmos `DbtDag`
+    bindings (dbt project + select/exclude selectors), `BashOperator` dbt
+    selectors, `Variable.get`/`BaseHook.get_connection` references, and
+    `Dataset` declarations.
+
+    Returns an EMPTY result for non-Airflow Python files (detected by a head
+    scan for `from airflow` / `from cosmos` imports), so it's safe to dispatch
+    on every `.py` file.
+    """
+    try:
+        import tree_sitter_python as tspy
+        from tree_sitter import Language, Parser
+    except ImportError:
+        return {"nodes": [], "edges": [], "error": "tree_sitter_python not installed"}
+
+    try:
+        source = path.read_bytes()
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    if not _is_airflow_file(source):
+        return {"nodes": [], "edges": []}
+
+    try:
+        parser = Parser(Language(tspy.language()))
+        tree = parser.parse(source)
+        root = tree.root_node
+    except Exception as e:
+        return {"nodes": [], "edges": [], "error": str(e)}
+
+    str_path = str(path)
+    file_nid = _make_id("airflow", path.stem)
+    nodes: list[dict] = [{"id": file_nid, "label": path.name, "file_type": "code",
+                          "source_file": str_path, "source_location": "L1"}]
+    edges: list[dict] = []
+    seen_ids: set[str] = {file_nid}
+    # Map Python variable name → node id, so `t1 >> t2` can resolve to graph nodes.
+    var_to_node: dict[str, str] = {}
+    # Module-level `NAME = "string"` constants, so we can resolve
+    # `BaseHook.get_connection(STANNP_CONN_ID)` to the actual literal.
+    var_to_str: dict[str, str] = {}
+    # Module-level `NAME = SomeCall(...)` assignments, so DbtDag(render_config=name)
+    # can be resolved back to the RenderConfig(...) call AST.
+    var_to_call_node: dict[str, object] = {}
+
+    def _read(n) -> str:
+        return source[n.start_byte:n.end_byte].decode("utf-8", errors="replace")
+
+    def _strip_quotes(s: str) -> str:
+        s = s.strip()
+        if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+            return s[1:-1]
+        return s
+
+    def _resolve_string(node) -> str | None:
+        """Extract a string literal from various AST shapes:
+        plain `string`, `concatenated_string` (`"a" "b"`),
+        `parenthesized_expression` wrapping any of the above, f-string
+        (literal parts are kept, interpolations are stripped), and bare
+        `identifier` resolved against `var_to_str`."""
+        if node is None:
+            return None
+        t = node.type
+        if t == "string":
+            # f-string handling: walk children, keep `string_content`, drop `interpolation`
+            parts = []
+            has_interp = False
+            for c in node.children:
+                if c.type in ("string_content", "string_literal"):
+                    parts.append(_read(c))
+                elif c.type == "interpolation":
+                    has_interp = True
+                elif c.type in ("string_start", "string_end", "escape_sequence"):
+                    if c.type == "escape_sequence":
+                        # Decode common escapes naively
+                        raw = _read(c)
+                        parts.append(raw.encode().decode("unicode_escape", errors="replace"))
+            if parts:
+                return "".join(parts)
+            # Fall back to text minus quotes
+            return _strip_quotes(_read(node))
+        if t == "concatenated_string":
+            return "".join((_resolve_string(c) or "") for c in node.children if c.is_named)
+        if t == "parenthesized_expression":
+            for c in node.children:
+                if c.is_named:
+                    return _resolve_string(c)
+            return None
+        if t == "identifier":
+            return var_to_str.get(_read(node))
+        return None
+
+    def _ensure_node(nid: str, label: str, line: int = 1, **extras) -> None:
+        if nid in seen_ids:
+            return
+        seen_ids.add(nid)
+        n = {"id": nid, "label": label, "file_type": "code",
+             "source_file": str_path, "source_location": f"L{line}"}
+        for k, v in extras.items():
+            if v is not None:
+                n[k] = v
+        nodes.append(n)
+
+    def _add_edge(src: str, tgt: str, relation: str, line: int = 0) -> None:
+        edges.append({"source": src, "target": tgt, "relation": relation,
+                      "confidence": "EXTRACTED", "source_file": str_path,
+                      "source_location": f"L{line}" if line else "", "weight": 1.0})
+
+    def _set_node_attr(nid: str, key: str, value) -> None:
+        for n in nodes:
+            if n["id"] == nid:
+                n[key] = value
+                return
+
+    def _call_function_name(call_node) -> str:
+        fn = call_node.child_by_field_name("function")
+        if fn is None:
+            return ""
+        return _read(fn)
+
+    def _kwarg_node(call_node, key: str):
+        args = call_node.child_by_field_name("arguments")
+        if args is None:
+            return None
+        for c in args.children:
+            if c.type == "keyword_argument":
+                k = c.child_by_field_name("name")
+                v = c.child_by_field_name("value")
+                if k and v and _read(k) == key:
+                    return v
+        return None
+
+    def _kwarg_string(call_node, key: str) -> str | None:
+        v = _kwarg_node(call_node, key)
+        return _resolve_string(v) if v is not None else None
+
+    def _resolve_call(node):
+        """If node is a `call`, return it.  If it's an `identifier` we've seen
+        bound to a call (e.g. `render_config = RenderConfig(...)`), return that
+        underlying call AST.  Otherwise None."""
+        if node is None:
+            return None
+        if node.type == "call":
+            return node
+        if node.type == "identifier":
+            return var_to_call_node.get(_read(node))
+        return None
+
+    def _string_list(list_node) -> list[str]:
+        if list_node is None or list_node.type != "list":
+            return []
+        return [_strip_quotes(_read(c)) for c in list_node.children if c.type == "string"]
+
+    # ─── Pass 0: collect module-level variable bindings ────────────────────
+    # `STANNP_CONN_ID = "stannp_api"` so Variable/Connection lookups resolve;
+    # `render_config = RenderConfig(...)` so DbtDag(render_config=name) resolves.
+
+    def _walk_p0(node) -> None:
+        if node.type == "assignment":
+            left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
+            if left is not None and left.type == "identifier" and right is not None:
+                name = _read(left)
+                resolved = _resolve_string(right)
+                if resolved is not None:
+                    var_to_str[name] = resolved
+                elif right.type == "call":
+                    var_to_call_node[name] = right
+        for c in node.children:
+            _walk_p0(c)
+
+    _walk_p0(root)
+
+    # ─── Pass 1: DAG / Operator / Cosmos / Dataset declarations ─────────────
+
+    def _parse_dbt_selectors_from_bash(cmd: str, owner_nid: str, line: int) -> None:
+        try:
+            import shlex
+            tokens = shlex.split(cmd, posix=True)
+        except Exception:
+            return
+        i = 0
+        while i < len(tokens):
+            t = tokens[i]
+            if t in ("--select", "-s") and i + 1 < len(tokens):
+                sel = tokens[i + 1]
+                sel_nid = _make_id("dbt_selector", sel)
+                _ensure_node(sel_nid, f"dbt: {sel}", line=line, dbt_selector=sel)
+                _add_edge(owner_nid, sel_nid, "selects_dbt", line)
+                i += 2
+            elif t == "--exclude" and i + 1 < len(tokens):
+                exc = tokens[i + 1]
+                exc_nid = _make_id("dbt_selector", exc)
+                _ensure_node(exc_nid, f"dbt: {exc}", line=line, dbt_selector=exc)
+                _add_edge(owner_nid, exc_nid, "excludes_dbt", line)
+                i += 2
+            else:
+                i += 1
+
+    def _handle_call(call_node, var_name: str | None, line: int) -> str | None:
+        fn_full = _call_function_name(call_node)
+        bare = fn_full.split(".")[-1] if fn_full else ""
+
+        # ── DAG ──
+        if bare in _AIRFLOW_DAG_NAMES:
+            dag_id = _kwarg_string(call_node, "dag_id") or var_name or "anonymous_dag"
+            schedule = (_kwarg_string(call_node, "schedule")
+                        or _kwarg_string(call_node, "schedule_interval"))
+            nid = _make_id("airflow_dag", dag_id)
+            _ensure_node(nid, f"DAG: {dag_id}", line=line,
+                         dag_id=dag_id, dag_schedule=schedule, cosmos=(bare == "DbtDag"))
+            _add_edge(file_nid, nid, "defines_dag", line)
+
+            # Cosmos-specific: extract project_config + render_config selectors.
+            # Both can be either inline `=ProjectConfig(...)` or assigned via a
+            # variable upstream (`pc = ProjectConfig(...); DbtDag(project_config=pc)`).
+            if bare == "DbtDag":
+                proj_cfg = _resolve_call(_kwarg_node(call_node, "project_config"))
+                if proj_cfg is not None:
+                    project_path = None
+                    args = proj_cfg.child_by_field_name("arguments")
+                    if args:
+                        # First positional string OR `dbt_project_path=` kwarg
+                        for c in args.children:
+                            if c.type == "string":
+                                project_path = _resolve_string(c)
+                                break
+                            if c.type == "keyword_argument":
+                                kk = c.child_by_field_name("name")
+                                vv = c.child_by_field_name("value")
+                                if kk and vv and _read(kk) in ("dbt_project_path", "project_path"):
+                                    project_path = _resolve_string(vv)
+                                    if project_path:
+                                        break
+                    if project_path:
+                        proj_nid = _make_id("dbt_project", project_path)
+                        _ensure_node(proj_nid, f"dbt project: {project_path}",
+                                     line=line, dbt_project_path=project_path)
+                        _add_edge(nid, proj_nid, "uses_dbt_project", line)
+                render_cfg = _resolve_call(_kwarg_node(call_node, "render_config"))
+                if render_cfg is not None:
+                    select_node = _kwarg_node(render_cfg, "select")
+                    exclude_node = _kwarg_node(render_cfg, "exclude")
+                    for sel in _string_list(select_node):
+                        sel_nid = _make_id("dbt_selector", sel)
+                        _ensure_node(sel_nid, f"dbt: {sel}", line=line, dbt_selector=sel)
+                        _add_edge(nid, sel_nid, "selects_dbt", line)
+                    for exc in _string_list(exclude_node):
+                        exc_nid = _make_id("dbt_selector", exc)
+                        _ensure_node(exc_nid, f"dbt: {exc}", line=line, dbt_selector=exc)
+                        _add_edge(nid, exc_nid, "excludes_dbt", line)
+
+            if var_name:
+                var_to_node[var_name] = nid
+            return nid
+
+        # ── Cosmos task group ──
+        if bare in _AIRFLOW_TASKGROUP_NAMES:
+            group_id = _kwarg_string(call_node, "group_id") or var_name or "task_group"
+            nid = _make_id("airflow_taskgroup", group_id)
+            _ensure_node(nid, f"task_group: {group_id}", line=line, group_id=group_id)
+            _add_edge(file_nid, nid, "defines_taskgroup", line)
+            if var_name:
+                var_to_node[var_name] = nid
+            return nid
+
+        # ── Operator / Sensor ──
+        if bare and any(bare.endswith(suf) for suf in _AIRFLOW_OPERATOR_SUFFIXES):
+            task_id = _kwarg_string(call_node, "task_id") or var_name or "anonymous_task"
+            nid = _make_id("airflow_task", task_id)
+            _ensure_node(nid, f"task: {task_id}", line=line,
+                         task_id=task_id, airflow_operator=bare)
+            _add_edge(file_nid, nid, "defines_task", line)
+
+            if bare == "BashOperator":
+                cmd = _kwarg_string(call_node, "bash_command")
+                if cmd:
+                    _set_node_attr(nid, "bash_command", cmd[:300])
+                    _parse_dbt_selectors_from_bash(cmd, nid, line)
+            if bare == "PythonOperator":
+                pc_node = _kwarg_node(call_node, "python_callable")
+                if pc_node is not None and pc_node.type == "identifier":
+                    callable_name = _read(pc_node)
+                    callable_nid = _make_id("python_callable", callable_name)
+                    _ensure_node(callable_nid, f"{callable_name}()",
+                                 line=line, python_callable=callable_name)
+                    _add_edge(nid, callable_nid, "calls_python", line)
+
+            if var_name:
+                var_to_node[var_name] = nid
+            return nid
+
+        # ── Dataset ──
+        if bare == "Dataset":
+            args = call_node.child_by_field_name("arguments")
+            if args:
+                for c in args.children:
+                    if c.type == "string":
+                        ds_uri = _strip_quotes(_read(c))
+                        ds_nid = _make_id("airflow_dataset", ds_uri)
+                        _ensure_node(ds_nid, f"dataset: {ds_uri}",
+                                     line=line, dataset_uri=ds_uri)
+                        if var_name:
+                            var_to_node[var_name] = ds_nid
+                        return ds_nid
+        return None
+
+    def _walk_p1(node) -> None:
+        # `with DAG(...) as dag:` style
+        if node.type == "with_statement":
+            for c in node.children:
+                if c.type != "with_clause":
+                    continue
+                for item in c.children:
+                    if item.type != "with_item":
+                        continue
+                    for sub in item.children:
+                        if sub.type == "as_pattern":
+                            value_node = sub.child_by_field_name("value")
+                            alias_node = sub.child_by_field_name("alias")
+                            if value_node is None and sub.children:
+                                value_node = sub.children[0]
+                            if alias_node is None:
+                                for x in sub.children:
+                                    if x.type == "as_pattern_target":
+                                        alias_node = x
+                                        break
+                            var_name = None
+                            if alias_node is not None:
+                                # alias_node may be `as_pattern_target` containing identifier
+                                if alias_node.type == "identifier":
+                                    var_name = _read(alias_node)
+                                else:
+                                    for x in alias_node.children:
+                                        if x.type == "identifier":
+                                            var_name = _read(x)
+                                            break
+                            if value_node is not None and value_node.type == "call":
+                                _handle_call(value_node, var_name, node.start_point[0] + 1)
+                        elif sub.type == "call":
+                            _handle_call(sub, None, node.start_point[0] + 1)
+        # `name = Operator(...)` style
+        if node.type == "assignment":
+            left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
+            if left is not None and right is not None and left.type == "identifier" and right.type == "call":
+                _handle_call(right, _read(left), node.start_point[0] + 1)
+        for c in node.children:
+            _walk_p1(c)
+
+    _walk_p1(root)
+
+    # ─── Pass 2: task dependencies (>> << chain) ───────────────────────────
+
+    def _resolve_dep_operand(node) -> list[str]:
+        if node is None:
+            return []
+        if node.type == "identifier":
+            nid = var_to_node.get(_read(node))
+            return [nid] if nid else []
+        if node.type == "list":
+            out = []
+            for c in node.children:
+                if c.type == "identifier":
+                    nid = var_to_node.get(_read(c))
+                    if nid:
+                        out.append(nid)
+            return out
+        if node.type == "binary_operator":
+            # chained `t1 >> t2 >> t3` — resolve recursively, emit edges, return rightmost
+            op = node.child_by_field_name("operator")
+            left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
+            left_nids = _resolve_dep_operand(left)
+            right_nids = _resolve_dep_operand(right)
+            if op is not None and _read(op) in (">>", "<<"):
+                line = node.start_point[0] + 1
+                if _read(op) == ">>":
+                    for ln in left_nids:
+                        for rn in right_nids:
+                            _add_edge(ln, rn, "depends_on", line)
+                    return right_nids
+                else:
+                    for ln in left_nids:
+                        for rn in right_nids:
+                            _add_edge(rn, ln, "depends_on", line)
+                    return left_nids
+            return right_nids or left_nids
+        return []
+
+    def _walk_p2(node) -> None:
+        if node.type == "binary_operator":
+            op = node.child_by_field_name("operator")
+            if op is not None and _read(op) in (">>", "<<"):
+                left = node.child_by_field_name("left")
+                right = node.child_by_field_name("right")
+                left_nids = _resolve_dep_operand(left)
+                right_nids = _resolve_dep_operand(right)
+                line = node.start_point[0] + 1
+                if _read(op) == ">>":
+                    for ln in left_nids:
+                        for rn in right_nids:
+                            _add_edge(ln, rn, "depends_on", line)
+                else:
+                    for ln in left_nids:
+                        for rn in right_nids:
+                            _add_edge(rn, ln, "depends_on", line)
+                return  # avoid walking into chained children twice
+        if node.type == "call":
+            fn_name = _call_function_name(node)
+            bare = fn_name.split(".")[-1] if fn_name else ""
+            if bare in ("chain", "chain_linear"):
+                args = node.child_by_field_name("arguments")
+                if args:
+                    seq = []
+                    for c in args.children:
+                        if c.type == "identifier":
+                            nid = var_to_node.get(_read(c))
+                            if nid:
+                                seq.append(nid)
+                    line = node.start_point[0] + 1
+                    for i in range(len(seq) - 1):
+                        _add_edge(seq[i], seq[i + 1], "depends_on", line)
+        for c in node.children:
+            _walk_p2(c)
+
+    _walk_p2(root)
+
+    # ─── Pass 3: runtime dependencies (Variable, Connection) ────────────────
+
+    def _walk_p3(node) -> None:
+        if node.type == "call":
+            fn_name = _call_function_name(node)
+            args = node.child_by_field_name("arguments")
+            line = node.start_point[0] + 1
+            if fn_name == "Variable.get" and args is not None:
+                first = next((c for c in args.children if c.is_named), None)
+                var_name = _resolve_string(first)
+                if var_name:
+                    nid = _make_id("airflow_variable", var_name)
+                    _ensure_node(nid, f"variable: {var_name}",
+                                 line=line, airflow_variable=var_name)
+                    _add_edge(file_nid, nid, "uses_variable", line)
+            if fn_name == "BaseHook.get_connection" and args is not None:
+                first = next((c for c in args.children if c.is_named), None)
+                conn_name = _resolve_string(first)
+                if conn_name:
+                    nid = _make_id("airflow_connection", conn_name)
+                    _ensure_node(nid, f"connection: {conn_name}",
+                                 line=line, airflow_connection=conn_name)
+                    _add_edge(file_nid, nid, "uses_connection", line)
+        for c in node.children:
+            _walk_p3(c)
+
+    _walk_p3(root)
+
+    return {"nodes": nodes, "edges": edges}
+
+
+def extract_python_with_airflow(path: Path) -> dict:
+    """Wrapper: runs the standard Python extractor and additionally augments
+    the result with Airflow / Cosmos DAG structure when the file is an Airflow
+    DAG (detected by import marker scan).  Non-Airflow .py files get the plain
+    `extract_python` output, no overhead beyond a 5KB head read."""
+    py_result = extract_python(path)
+    af_result = extract_airflow_dag(path)
+    if af_result.get("nodes"):
+        # Skip the file-level airflow node — keep only its real children
+        # (the python extractor already created a file-level node)
+        af_nodes = af_result["nodes"]
+        if af_nodes and af_nodes[0]["label"] == path.name:
+            af_file_nid = af_nodes[0]["id"]
+            # Remap edges from airflow file_nid → python file_nid for cleaner merge
+            py_file_label = path.name
+            py_file_id = next((n["id"] for n in py_result["nodes"]
+                               if n.get("label") == py_file_label), None)
+            if py_file_id:
+                for e in af_result["edges"]:
+                    if e["source"] == af_file_nid:
+                        e["source"] = py_file_id
+                    if e["target"] == af_file_nid:
+                        e["target"] = py_file_id
+                af_nodes = af_nodes[1:]  # drop airflow's file-level duplicate
+        py_result["nodes"].extend(af_nodes)
+        py_result["edges"].extend(af_result["edges"])
+    return py_result
+
+
 def extract_lua(path: Path) -> dict:
     """Extract functions, methods, require() imports, and calls from a .lua file."""
     return _extract_generic(path, _LUA_CONFIG)
@@ -3868,7 +4377,7 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
     root = root.resolve()
 
     _DISPATCH: dict[str, Any] = {
-        ".py": extract_python,
+        ".py": extract_python_with_airflow,
         ".js": extract_js,
         ".jsx": extract_js,
         ".mjs": extract_js,
