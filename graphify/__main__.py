@@ -1090,6 +1090,9 @@ def main() -> None:
         print("  ast-only <path>         AST-only extraction to stdout (no cache writes, no LLM) — plan-mode-safe")
         print("    --cache-root DIR        cache dir (default: /tmp/graphify-ast)")
         print("    --no-cache              force fresh extraction (ignore cache)")
+        print("  dbt-manifest <manifest.json>  convert dbt target/manifest.json to graph.json (env-resolved lineage)")
+        print("    --out PATH              output path (default: stdout)")
+        print("    --project-root DIR      resolve manifest paths against this dir")
         print("  hook install            install post-commit/post-checkout git hooks (all platforms)")
         print("  hook uninstall          remove git hooks")
         print("  hook status             check if git hooks are installed")
@@ -1710,6 +1713,49 @@ def main() -> None:
                 pass
         result = run_benchmark(graph_path, corpus_words=corpus_words)
         print_benchmark(result)
+
+    elif cmd == "dbt-manifest":
+        # Convert dbt's `target/manifest.json` (produced by `dbt parse`) to
+        # graphify graph format. Node IDs match the file-walking dbt
+        # extractors, so loading both into the same graph collapses each
+        # model's file-node + manifest-node into one merged entity.
+        if len(sys.argv) < 3 or sys.argv[2] in ("-h", "--help"):
+            print("Usage: graphify dbt-manifest <manifest.json> [--out PATH] [--project-root DIR]", file=sys.stderr)
+            print("  --out PATH          where to write graph.json (default: stdout)", file=sys.stderr)
+            print("  --project-root DIR  resolve manifest.original_file_path against this dir (optional)", file=sys.stderr)
+            sys.exit(2)
+
+        manifest_path = Path(sys.argv[2]).expanduser().resolve()
+        if not manifest_path.exists():
+            print(f"error: manifest not found: {manifest_path}", file=sys.stderr)
+            sys.exit(1)
+
+        out_path = None
+        project_root = None
+        args = sys.argv[3:]
+        i = 0
+        while i < len(args):
+            if args[i] == "--out" and i + 1 < len(args):
+                out_path = Path(args[i + 1]).expanduser().resolve()
+                i += 2
+            elif args[i] == "--project-root" and i + 1 < len(args):
+                project_root = Path(args[i + 1]).expanduser().resolve()
+                i += 2
+            else:
+                i += 1
+
+        from graphify.dbt_manifest import convert, stats
+        graph = convert(manifest_path, project_root)
+        s = stats(graph)
+        print(f"Converted manifest: {s['total_nodes']} nodes, {s['total_edges']} edges", file=sys.stderr)
+        for rt, c in sorted(s["by_resource_type"].items(), key=lambda x: -x[1]):
+            print(f"    {rt}: {c}", file=sys.stderr)
+        if out_path:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(graph, indent=2), encoding="utf-8")
+            print(f"  → wrote {out_path}", file=sys.stderr)
+        else:
+            print(json.dumps(graph, indent=2), flush=True)
 
     elif cmd == "ast-only":
         # Plan-mode-safe AST extraction: writes nothing under the user's project
