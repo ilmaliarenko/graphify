@@ -1836,6 +1836,15 @@ def extract_dbt_sql(path: Path) -> dict:
                         m = re.search(r"materialized\s*=\s*['\"]([^'\"]+)['\"]", cfg_text)
                         if m:
                             file_node["dbt_materialized"] = m.group(1)
+                        # Tags can be tags=['a', 'b'] or tags=["a"] — capture all bare strings
+                        # inside the tags=[ ... ] list. Used by the bridges resolver to match
+                        # Airflow `selects_dbt: tag:X` selectors to actual dbt models.
+                        tags_match = re.search(r"tags\s*=\s*\[([^\]]*)\]", cfg_text)
+                        if tags_match:
+                            inner = tags_match.group(1)
+                            tags = re.findall(r"['\"]([^'\"]+)['\"]", inner)
+                            if tags:
+                                file_node["dbt_tags"] = tags
         for c in node.children:
             walk(c)
 
@@ -4556,6 +4565,21 @@ def extract(paths: list[Path], cache_root: Path | None = None) -> dict:
             item["source_file"] = str(sf_path.relative_to(root))
         except ValueError:
             pass
+
+    # Cross-system bridges — runs after all per-file extractors finish so it
+    # can spot entities that exist in multiple systems (e.g. an Airflow Cosmos
+    # selector `tag:X` and a dbt model that carries tag X). Runs deterministically
+    # off node attributes already present; no LLM, no extra parsing.
+    try:
+        from graphify.bridges import compute_bridges
+        bridge_nodes, bridge_edges = compute_bridges(all_nodes, all_edges)
+        all_nodes.extend(bridge_nodes)
+        all_edges.extend(bridge_edges)
+    except Exception:
+        # Bridge resolution is opportunistic — never fail the whole extraction
+        # because a heuristic crashed. Real failures should be debuggable via
+        # the bridges_to edge tags but never block the pipeline.
+        pass
 
     return {
         "nodes": all_nodes,

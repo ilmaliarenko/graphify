@@ -2,7 +2,7 @@
   config(
     alias='daily_book_sales',
     materialized='table',
-    tags=['analytics', 'demo']
+    tags=['bookstore', 'analytics']
   )
 }}
 
