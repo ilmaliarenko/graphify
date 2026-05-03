@@ -1040,3 +1040,162 @@ def test_dbt_yaml_handles_jinja_templated_names_gracefully():
             assert "{{" not in n["id"]
     finally:
         os.unlink(tmp_path)
+
+
+# ── Airflow / Astronomer Cosmos DAG extractor ────────────────────────────────
+
+from graphify.extract import extract_airflow_dag, extract_python_with_airflow
+
+
+def test_airflow_no_error():
+    r = extract_airflow_dag(FIXTURES / "sample_airflow_dag.py")
+    assert "error" not in r, r.get("error")
+
+
+def test_airflow_finds_dag_node():
+    r = extract_airflow_dag(FIXTURES / "sample_airflow_dag.py")
+    labels = [n["label"] for n in r["nodes"]]
+    assert any("DAG: bookstore_daily_report" in l for l in labels)
+
+
+def test_airflow_finds_cosmos_dbt_dag():
+    r = extract_airflow_dag(FIXTURES / "sample_airflow_dag.py")
+    cosmos_dags = [n for n in r["nodes"] if n.get("cosmos") is True]
+    assert len(cosmos_dags) == 1
+    assert cosmos_dags[0]["dag_id"] == "dbt_refresh_inventory"
+
+
+def test_airflow_dbt_project_extracted_from_cosmos():
+    r = extract_airflow_dag(FIXTURES / "sample_airflow_dag.py")
+    proj_edges = [e for e in r["edges"] if e["relation"] == "uses_dbt_project"]
+    assert len(proj_edges) == 1
+    proj_node = next(n for n in r["nodes"] if n["id"] == proj_edges[0]["target"])
+    assert proj_node.get("dbt_project_path") == "/usr/local/airflow/dbt/bookstore_dbt_project"
+
+
+def test_airflow_dbt_selectors_extracted_from_render_config():
+    """RenderConfig was assigned to a variable upstream — extractor must
+    resolve `render_config=render_config` back to the RenderConfig call."""
+    r = extract_airflow_dag(FIXTURES / "sample_airflow_dag.py")
+    selects = {e["target"] for e in r["edges"] if e["relation"] == "selects_dbt"}
+    excludes = {e["target"] for e in r["edges"] if e["relation"] == "excludes_dbt"}
+    # From RenderConfig
+    assert any("tag_bookstore" in s for s in selects)
+    assert any("path_models_inventory" in s for s in selects)
+    assert any("tag_experimental" in e for e in excludes)
+
+
+def test_airflow_dbt_selectors_from_bash_command():
+    """BashOperator with `dbt build --select tag:X --exclude tag:Y` —
+    extractor parses the bash command (incl. concatenated + f-string) and
+    emits selector edges from the task."""
+    r = extract_airflow_dag(FIXTURES / "sample_airflow_dag.py")
+    bash_select = [e for e in r["edges"]
+                   if e["relation"] == "selects_dbt"
+                   and e["source"].startswith("airflow_task_")]
+    bash_exclude = [e for e in r["edges"]
+                    if e["relation"] == "excludes_dbt"
+                    and e["source"].startswith("airflow_task_")]
+    assert any("tag_bookstore" in e["target"] for e in bash_select)
+    assert any("tag_slow" in e["target"] for e in bash_exclude)
+
+
+def test_airflow_finds_tasks():
+    r = extract_airflow_dag(FIXTURES / "sample_airflow_dag.py")
+    tasks = [n for n in r["nodes"] if n.get("airflow_operator")]
+    task_ids = {n.get("task_id") for n in tasks}
+    assert {"pull_orders_from_s3", "refresh_inventory_models",
+            "publish_daily_report", "notify_partners"}.issubset(task_ids)
+
+
+def test_airflow_task_dependencies_via_rshift():
+    """`pull_orders >> refresh_inventory >> publish_report >> notify_partners` —
+    chained `>>` must produce 3 depends_on edges."""
+    r = extract_airflow_dag(FIXTURES / "sample_airflow_dag.py")
+    deps = [e for e in r["edges"] if e["relation"] == "depends_on"]
+    assert len(deps) >= 3
+
+
+def test_airflow_python_callable_linked():
+    r = extract_airflow_dag(FIXTURES / "sample_airflow_dag.py")
+    callable_edges = [e for e in r["edges"] if e["relation"] == "calls_python"]
+    callable_targets = [e["target"] for e in callable_edges]
+    assert any("post_sales_report" in t for t in callable_targets)
+
+
+def test_airflow_variable_get_with_string_literal():
+    r = extract_airflow_dag(FIXTURES / "sample_airflow_dag.py")
+    var_edges = [e for e in r["edges"] if e["relation"] == "uses_variable"]
+    var_names = [e["target"] for e in var_edges]
+    assert any("BOOKSTORE_REGION" in v.upper() for v in var_names)
+
+
+def test_airflow_variable_get_with_default_var_arg():
+    """Variable.get takes an `default_var=` kwarg — the first positional arg
+    is still the variable name we want to capture."""
+    r = extract_airflow_dag(FIXTURES / "sample_airflow_dag.py")
+    var_edges = [e for e in r["edges"] if e["relation"] == "uses_variable"]
+    var_names = [e["target"] for e in var_edges]
+    assert any("BOOKSTORE_REPORT_CHUNK" in v.upper() for v in var_names)
+
+
+def test_airflow_basehook_get_connection_resolves_variable():
+    """BaseHook.get_connection(WEBHOOK_CONN_ID) where WEBHOOK_CONN_ID is a
+    module-level constant — extractor must resolve the identifier."""
+    r = extract_airflow_dag(FIXTURES / "sample_airflow_dag.py")
+    conn_edges = [e for e in r["edges"] if e["relation"] == "uses_connection"]
+    conn_names = [e["target"] for e in conn_edges]
+    assert any("bookstore_webhook" in c for c in conn_names)
+
+
+def test_airflow_dataset_declared():
+    r = extract_airflow_dag(FIXTURES / "sample_airflow_dag.py")
+    ds_nodes = [n for n in r["nodes"] if n.get("dataset_uri")]
+    uris = {n["dataset_uri"] for n in ds_nodes}
+    assert "s3://bookstore-raw/orders/" in uris
+    assert "s3://bookstore-raw/inventory/" in uris
+
+
+def test_airflow_extractor_skips_non_airflow_python_files():
+    """A regular .py file with no airflow imports must produce empty result —
+    the extractor is opt-in via head-scan for `from airflow` markers."""
+    import tempfile, os
+    src = "def hello():\n    return 42\n\nclass Foo:\n    pass\n"
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write(src)
+        tmp_path = f.name
+    try:
+        r = extract_airflow_dag(Path(tmp_path))
+        assert r["nodes"] == []
+        assert r["edges"] == []
+    finally:
+        os.unlink(tmp_path)
+
+
+def test_airflow_no_dangling_edges():
+    r = extract_airflow_dag(FIXTURES / "sample_airflow_dag.py")
+    node_ids = {n["id"] for n in r["nodes"]}
+    for e in r["edges"]:
+        assert e["source"] in node_ids, f"Dangling source: {e}"
+        assert e["target"] in node_ids, f"Dangling target: {e}"
+
+
+def test_extract_python_with_airflow_combines_both():
+    """The .py dispatcher wrapper runs extract_python AND extract_airflow_dag
+    on Airflow files — result should contain BOTH Python class/function
+    nodes AND Airflow DAG/Task nodes, on a single file extraction."""
+    r = extract_python_with_airflow(FIXTURES / "sample_airflow_dag.py")
+    labels = [n["label"] for n in r["nodes"]]
+    # Python side: function `post_sales_report` defined in the file
+    assert any("post_sales_report" in l for l in labels)
+    # Airflow side: task and DAG
+    assert any("DAG:" in l for l in labels)
+    assert any("task:" in l for l in labels)
+
+
+def test_extract_python_with_airflow_no_overhead_for_plain_python():
+    """For non-Airflow .py files (e.g. existing fixtures), the wrapper just
+    returns plain python output."""
+    r = extract_python_with_airflow(FIXTURES / "sample.py")
+    af_specific = [n for n in r["nodes"] if n.get("airflow_operator") or n.get("dag_id")]
+    assert af_specific == []
